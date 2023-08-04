@@ -1,4 +1,3 @@
-
 '''
 root_to_ml.py
 
@@ -21,7 +20,6 @@ Nicole Hartman
 Summer 2023
 '''
 
-import os,sys
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -29,7 +27,7 @@ from sklearn.preprocessing import StandardScaler
 import h5py
 from tqdm import tqdm
 import json 
-import matplotlib.pyplot as plt
+
 import uproot
 import awkward as ak
 import xarray as xr
@@ -48,9 +46,16 @@ trk_vars += [f't{n}' for n in [30,60,90]]
 talias = {v: f'track_{v}' for v in trk_vars}
 
 trk_vars += ['numPix','numSCT','numPix1L','numPix2L']
-
+for v in trk_vars[-4:]:
+    talias[v] = f'tracks_{v}'
 
 # derived vars 
+talias['sd0'] = 'd0/var_d0'
+talias['abs_sd0'] = 'abs(d0)'
+talias['sz0'] = 'z0/var_z0'
+talias['pt']  = '0.001 * abs(1/qOverP) * sin(theta)'
+talias['eta']  = '- log(tan(theta/2))'
+
 
 def processBatch(t,start,stop,jdf,jmask,iVars,deriv_vars,maxNumTrks=40,sort_var="abs_sd0"):
     '''
@@ -59,15 +64,13 @@ def processBatch(t,start,stop,jdf,jmask,iVars,deriv_vars,maxNumTrks=40,sort_var=
     '''
 
     # load in the track level array
-
     tak = t.arrays(trk_vars+['sd0','sz0','pt','eta','abs_sd0'],aliases=talias,
                    entry_start=start,entry_stop=stop)
 
     nEvts = len(tak)
-    jet_trk_idx = t.arrays('jet_tracks_idx',entry_start=start,entry_stop=stop)['jet_tracks_idx']
+    print(f'In processBatch, start={start}, stop={stop}, len(tak)={nEvts}')
 
-    #Get the entries that actually exist in the dataframe. This hopefully fixes missing data. 
-    jdf_entries = np.unique([i[0] for i in jdf.index])
+    jet_trk_idx = t.arrays('jet_tracks_idx',entry_start=start,entry_stop=stop)['jet_tracks_idx']
 
     """
     This has the structure I want: 
@@ -77,14 +80,12 @@ def processBatch(t,start,stop,jdf,jmask,iVars,deriv_vars,maxNumTrks=40,sort_var=
     - the tracks we select (in the tarr computation) 
     - and the same mask gets applied to jdf
     """
-    njets_all = np.array([len(jdf.loc[i,'pt']) if i in jdf_entries else 0 for i in range(start,start+nEvts)])
-    
+    njets_all = np.array([len(jdf.loc[i,'pt']) for i in range(start,start+nEvts)])
     jmask_hier = ak.unflatten(jmask,counts=njets_all)
 
     tarr = ak.Array([tak_i[jlinks] for tak_i,evt_lev_links,jmask_evt in zip(tak,jet_trk_idx,jmask_hier) 
-                     for jlinks, jmask_i in zip(evt_lev_links,jmask_evt) if (jmask_i) ])
-    
-    
+                 for jlinks, jmask_i in zip(evt_lev_links,jmask_evt) if jmask_i])
+
     jdf = jdf[jmask]
 
     # 1. Mask
@@ -92,11 +93,6 @@ def processBatch(t,start,stop,jdf,jmask,iVars,deriv_vars,maxNumTrks=40,sort_var=
     TO DO: Add the z0 * sin(theta) < 5 mm cut
     (and pixel quality cuts? or are those already here?)
     '''
-    
-    # Protection against running on single events that do not contain tracks
-    if len(tarr) < 1:
-        return None
-
     tmask = (tarr['pt'] > 0.5) & (abs(tarr['d0']) < 3.5)
     
     # Sort
@@ -114,7 +110,7 @@ def processBatch(t,start,stop,jdf,jmask,iVars,deriv_vars,maxNumTrks=40,sort_var=
     
     tnp = np.zeros((len(jdf),maxNumTrks,len(iVars)+len(deriv_vars)))  
 
-    assert len(iVars) + len(deriv_vars) == tnp.shape[-1] # Sanity check the dimensions
+    assert len(iVars) + 2 == tnp.shape[-1] # Sanity check the dimensions
 
     for i,v in enumerate(iVars):
         padded = ak.fill_none(ak.pad_none(tarr[tmask][idx][v], maxNumTrks, clip=True), 0)
@@ -297,70 +293,6 @@ def prepareForKeras(jdf,trk_xr,outputFile,mode=''):
     ALSO TO DO: d0, z0, sd0 and sz0 need to be w/r.t. PV (instead of beam spot)
     '''
     
-    def plotting(variables,jetlabels):
-        # Initialize lists of different flavor jets
-        lJets=[]
-        cJets=[]
-        bJets=[]
-        # Function to split jets based on flavor label
-        def jetSplit(data,labels):
-            # Initialize list of all jets
-            totaljets=[]
-            # Fill each flavor
-            for j in range(len(labels)):
-                if(labels[j]==0):
-                    lJets.append(data[j,:,:])
-                elif(labels[j]==1):
-                    cJets.append(data[j,:,:])
-                elif(labels[j]==2):
-                    bJets.append(data[j,:,:])
-                # Fill total jets
-            totaljets.append(lJets)
-            totaljets.append(cJets)
-            totaljets.append(bJets)
-            return totaljets
-        split=jetSplit(variables,jetlabels)
-            # Function to remove "padded" tracks
-        def removeZeros(data):
-            nozeros=[]
-            for flavor in data:
-                newflavor=[]
-                for jet in flavor:
-                    for track in jet:
-                        temptrack=track
-                        for feature in track: 
-                            if (feature <0.00001):
-                                break
-                            newflavor.append(temptrack)
-            
-                nozeros.append(newflavor)
-            return nozeros
-        nzsplit=removeZeros(split)
-        # Plot the input variables before scaling them
-        def plotIP(jets,parameters,titles,filenames):
-            for ip,parameter,title,filename in zip([0,1,2,3,4,5,6,7],parameters,titles,filenames):
-                plt.figure()
-                for i, flavor in zip([0,1,2], ['l','c','b']):
-                    splitjets=np.array(jets[i])
-                    flatjets=(splitjets[:,ip])
-                    jetmax=1.1*np.max(flatjets)
-                    jetmin=1.1*np.min(flatjets)
-                    plt.hist(flatjets,200,(jetmin,jetmax),alpha=0.5, density=True,label=f'{flavor}-jets', log=True)  
-                plt.xlabel(parameter)
-                plt.title(title)
-                plt.legend()
-                plt.savefig(filename+".png")
-                print("saving plot of" +filename)
-                plt.clf()
-            return 0
-            # x axis labels
-        parameterlist=[r'$d_{0}/\sigma_{d0}$',r'$z_{0}sin{\theta}/\sigma_{z_{0}sin{\theta}}$',r'$p_{T}$ fraction',r'$\Delta$R',r'number of pixel hits',r'number of SCT hits',r'$d_{0}$ [mm]',r'$z_{0}$ [mm]']
-            # titles 
-        titlelist=[r'Transverse IP Significance',r'Longitudinal IP Significance',r'Fraction of Jet $p_{T}$',r'Opening angle between track and jet: $\Delta$R',r'Combined number of hits in pixel layers',r'Combined number of hits in SCT layers',r'Jet Impact Parameters: $d_{0}$',r'Jet Impact Parameters: $z_{0}$']
-        filenamelist=['sd0','sz0','ptfrac','dr','numPix','numSCT','d0','z0']
-        plotIP(nzsplit,parameterlist,titlelist,filenamelist)
-        return 0
-    
     # Step 0: Process the string inputs for the vars in each norm sheme -> list
     noNormVars = ['sd0','sz0']
     logNormVars = ['ptfrac','dr']
@@ -372,160 +304,83 @@ def prepareForKeras(jdf,trk_xr,outputFile,mode=''):
     
     # Step 1: Select the relevant variables
     inpts = noNormVars + logNormVars + jointNormVars
-    # Adding loop for checking ranking
-    fullinpt = inpts
-    loopinpts=['none']+fullinpt
-    for j,loopinpt in enumerate(loopinpts):
-#        for j,checkvars in zip([0,1,2,3],['none','sd0','d0','sd0_d0']):
-        inpts=[]
-        notinc=loopinpt
-        #if j ==0:
-         #   notinc=[' ']
-        #elif j ==1:
-         #   notinc=['sd0']
-          #  noNormVars=['sz0']
-        #elif j==2:
-         #   notinc=['d0']
-         #   jointNormVars=['numPix','numSCT','z0']            
-        #elif j==3:
-         #   notinc=['sd0','d0']
-          #  noNormVars=['sz0']
-           # jointNormVars=['numPix','numSCT','z0']
-        if j ==0:
-            inpts = fullinpt
-        else:
-            for ip in fullinpt:
-                #for var in notinc:
-                if ip!= notinc:
-                    inpts.append(ip)
-        #Redefining no, log, and joint norm vars:
-        if notinc=='sd0':
-            noNormVars=['sz0']
-        elif notinc=='sz0':
-            noNormVars=['sd0']
-        else:
-            noNormVars=['sd0','sz0']
-        if notinc=='ptfrac':
-            logNormVars=['dr']
-        elif notinc=='dr':
-            logNormVars=['ptfrac']
-        else: 
-            logNormVars=['ptfrac','dr']
-        if notinc=='numPix':
-            jointNormVars=['numSCT','d0','z0']
-        elif notinc=='numSCT':
-            jointNormVars=['numPix','d0','z0']
-        elif notinc=='d0':
-            jointNormVars=['numPix','numSCT','z0']
-        elif notinc=='z0':
-            jointNormVars=['numPix','numSCT','d0']
-        else:
-            jointNormVars=['numPix','numSCT','d0','z0']
-            
-        # Check that all of the requested inputs are actually vars in trk_xr
-        trkInputs = list(trk_xr.coords['var'].values)
-        for inpt in inpts:
-            if inpt not in trkInputs:
-                raise ValueError('In prepareForKeras(): requested var {} not in trk_xr'.format(inpt))
     
-        X = trk_xr.loc[:,:,inpts].values
-        X_jet = jdf[jetVars]
-        ix = trk_xr.indexes['jet']
-        print("X.shape = ", X.shape)
+    # Check that all of the requested inputs are actually vars in trk_xr
+    trkInputs = list(trk_xr.coords['var'].values)
+    for inpt in inpts:
+        if inpt not in trkInputs:
+            raise ValueError('In prepareForKeras(): requested var {} not in trk_xr'.format(inpt))
     
-        # Keep track of which tracks in the jet are masked
-        mask = ~ np.all(X == 0, axis=-1)
-        print("mask",mask.shape)
-        # Plotting the input variables:
-        # Go from pdg ID to the integers for the considered classes 
-        pdg_to_class = {0:0, 4:1, 5:2, 15:3}
-        y = jdf.label.replace(pdg_to_class).values
+    X = trk_xr.loc[:,:,inpts].values
+    X_jet = jdf[jetVars]
+    ix = trk_xr.indexes['jet']
+    print("X.shape = ", X.shape)
+    
+    # Keep track of which tracks in the jet are masked
+    mask = ~ np.all(X == 0, axis=-1)
+    print("mask",mask.shape)
+    
+    # Take the log of the desired variables
+    for i, v in enumerate(logNormVars):
+        j = i + len(noNormVars)
+        X[:,:,j][mask] = np.log(np.where(X[:,:,j][mask]==0,1e-8,X[:,:,j][mask]))
 
-        # Step 2: Train / test split (if mode is an empty string
-        if len(mode) == 0: 
-            random_seed = 25
-            X_train, X_test, y_train, y_test, ix_train, ix_test, w_train, w_test, = \
+    # Go from pdg ID to the integers for the considered classes 
+    pdg_to_class = {0:0, 4:1, 5:2, 15:3}
+    y = jdf.label.replace(pdg_to_class).values
+    
+    # Step 2: Train / test split (if mode is an empty string
+    if len(mode) == 0: 
+        random_seed = 25
+        X_train, X_test, y_train, y_test, ix_train, ix_test, w_train, w_test, = \
             train_test_split(X, y, ix, jdf.sample_weight, test_size=0.333,
                              random_state=random_seed)
-        elif mode == 'train':
-            X_train = X   
-        elif mode == 'test':
-            X_test = X   
-
-        
-        # Only plot for one run, for the case where all variables are included
-        if(j==0):
-            plotting(X_train,y_train)
-
-            
-
-        # Take the log of the desired variables
-        for i, v in enumerate(logNormVars):
-            j = i + len(noNormVars)
-            X[:,:,j][mask] = np.log(np.where(X[:,:,j][mask]==0,1e-8,X[:,:,j][mask]))
-            if len(mode) == 0: 
-                random_seed = 25
-                X_train, X_test, y_train, y_test, ix_train, ix_test, w_train, w_test, = \
-                train_test_split(X, y, ix, jdf.sample_weight, test_size=0.333,random_state=random_seed)
-            elif mode == 'train':
-                X_train = X   
-            elif mode == 'test':
-                X_test = X   
-
-
-        # Step 3: Normalize the requested inputs
-        
-        # Get a string representing the variables getting scaled
-        varTag = "_".join(noNormVars) if len(noNormVars) != 0 else ''
-        varTag += '_logNorm_' + "_".join(logNormVars) if len(logNormVars) != 0 else ''
-        varTag += '_norm_' + "_".join(jointNormVars) if len(jointNormVars) != 0 else ''
-        
-        # Scale the vars and save the files
-        scalingfile = f"data/scale_{varTag}_no_{loopinpt}.json"
-        print("scalingfile",scalingfile)
-   
-        myDict = {}
+    elif mode == 'train':
+        X_train = X   
+    elif mode == 'test':
+        X_test = X   
  
-        if len(logNormVars)+len(jointNormVars) > 0:
-            
-            if mode != "test": 
-                scale(X_train[:,:,len(noNormVars):], logNormVars+jointNormVars, savevars=True,  filename=scalingfile)
-
-                myDict["X_train"]       =  X_train
-                myDict["y_train"]       =  y_train
-                myDict["ix_train"]      = ix_train
-                myDict["weights_train"] =  w_train
-
-
-            if mode != "train": 
-                scale(X_test[:,:, len(noNormVars):], logNormVars+jointNormVars, savevars=False, filename=scalingfile)
+    # Step 3: Normalize the requested inputs
     
-                myDict["X_test"]  =   X_test
-                myDict["y_test"]  =   y_test
-                myDict["ix_test"] =  ix_test
+    # Get a string representing the variables getting scaled
+    varTag = "_".join(noNormVars) if len(noNormVars) != 0 else ''
+    varTag += '_logNorm_' + "_".join(logNormVars) if len(logNormVars) != 0 else ''
+    varTag += '_norm_' + "_".join(jointNormVars) if len(jointNormVars) != 0 else ''
     
-        # Step 4: Save as h5py files
-        oldfile=outputFile
-        if j ==0:
-            outputFile=outputFile+'_all_var'
-        else:
-            outputFile=outputFile+'_no_'+str(loopinpt)
-        print("Saving datasets in {}".format(outputFile))
-        f = h5py.File(outputFile, 'w')
-        
-        for key, val in myDict.items():
-            f.create_dataset(key, data=val)
-        outputFile=oldfile
+    # Scale the vars and save the files
+    scalingfile = f"data/scale_{varTag}.json"
+    print("scalingfile",scalingfile)
+   
+    myDict = {}
+ 
+    if len(logNormVars)+len(jointNormVars) > 0:
+   
+        if mode != "test": 
+            scale(X_train[:,:,len(noNormVars):], logNormVars+jointNormVars, savevars=True,  filename=scalingfile)
+
+            myDict["X_train"]       =  X_train
+            myDict["y_train"]       =  y_train
+            myDict["ix_train"]      = ix_train
+            myDict["weights_train"] =  w_train
+
+
+        if mode != "train": 
+            scale(X_test[:,:, len(noNormVars):], logNormVars+jointNormVars, savevars=False, filename=scalingfile)
+    
+            myDict["X_test"]  =   X_test
+            myDict["y_test"]  =   y_test
+            myDict["ix_test"] =  ix_test
+    
+    # Step 4: Save as h5py files
+    print("Saving datasets in {}".format(outputFile))
+    f = h5py.File(outputFile, 'w')
+    
+    for key, val in myDict.items():
+        f.create_dataset(key, data=val)
+    
     f.close() 
 
 
-
-def create_folders(outputFile):
-    directory = os.path.dirname(outputFile)
-    
-    if directory != '':
-        os.makedirs(directory,exist_ok=True)
-    
 
 from argparse import ArgumentParser
 
@@ -557,44 +412,17 @@ def main():
                    help="Just write the jet df and track xarray files out, and \don't\ do the ML preprocessing.\n"\
                        +'(wait till the concat step).')
 
-    p.add_argument('--acts',action="store_true",
-                   help="Set to true to run on the acts ntuple")
-    
     args = p.parse_args()
 
     fName = args.filename
     tName = args.tName
     outputFile = args.output
-    create_folders(outputFile)
-    
     mode = args.mode
-    acts = args.acts
     onlyCuts = args.onlyCuts
 
     # Check some of the arguments validity
-    print("Mode", mode)
+    print(mode)
     assert (mode == 'train') or (mode == 'test') or (len(mode) == 0)
-
-    
-    # Setup the derived variables name  
-    
-    if not acts :
-        talias['sd0'] = 'd0/var_d0'
-        talias['abs_sd0'] = 'abs(d0)'
-        talias['sz0'] = 'z0/var_z0'
-        talias['pt']  = '0.001 * abs(1/qOverP) * sin(theta)'
-        talias['eta']  = '- log(tan(theta/2))'
-        for v in trk_vars[-4:]:
-            talias[v] = f'tracks_{v}'
-    else:
-        talias['sd0']     = 'track_signedd0sig'
-        talias['abs_sd0'] = 'abs(track_signedd0sig)'
-        talias['sz0']     = 'track_signedz0sinThetasig'
-        talias['pt']      = 'track_pt'
-        talias['eta']     = 'track_eta'
-        for v in trk_vars[-4:]:
-            talias[v] = f'track_{v}'
-
 
     if ".root" in fName:
 
@@ -605,16 +433,12 @@ def main():
         # Step 1: Read in the number of events
         t = f[tName]
         nEntries = t.num_entries
-        
+
+
         # Step 2a: Load in the jets
         jdf = t.arrays(jet_vars+["EventNumber"],library='pd',aliases=jalias)
+        jmask = (jdf['pt'] > 20) & (np.abs(jdf['eta']) < 4) & jdf['isHS'].astype('bool')
 
-
-        #print(jdf.to_string())
-                
-        jmask = (jdf['pt'] > 20) & (np.abs(jdf['eta']) < 4) & (jdf['isHS'].astype('bool')) #& (jdf['tracks_idx'].apply(lambda x: len(x) > 0))
-                                                                                              
-        
         if mode == 'test': 
             # Only keep even events
             jmask = jmask & (jdf["EventNumber"] % 2 == 0)
@@ -628,14 +452,13 @@ def main():
         # Step 2b: Read in just a part of the tree and batch the track preprocessing over these chunks
         batch_size = 1500
         chunks = np.arange(0,nEntries+batch_size, batch_size)
-        
 
         # Subset of the track vars (needed for training dips and / or GN1/2)
         tVars = ['d0','z0','var_d0', 'var_z0','qOverP','theta','phi','numPix','numSCT']
 
         iVars = tVars + ['sd0','sz0']
         deriv_vars= ['dr','ptfrac']
-        
+
         maxNumTrks=40
 
         trk_xr = xr.DataArray(0.,
@@ -643,24 +466,15 @@ def main():
                                   ('trk',np.arange(maxNumTrks)),
                                   ('var',iVars+deriv_vars)])
 
-        
+
         i=0
         for start, stop in tqdm(zip(chunks[:-1],chunks[1:])):
-            
-            #if start < 812:
-            #    continue
-            
-            print("Batch:",start,stop)
-            
+
             jdf_i   =   jdf.loc[(slice(start,stop-1),slice(None))]
             jmask_i = jmask.loc[(slice(start,stop-1),slice(None))]
-            
+
             t_np_i = processBatch(t,start,stop,jdf_i,jmask_i,maxNumTrks=maxNumTrks,iVars=iVars,deriv_vars=deriv_vars)   
-            
-            if not np.any(t_np_i):
-                print("Failed batch")
-                continue
-                
+
             trk_xr[i:i+t_np_i.shape[0]] = t_np_i         
             i += t_np_i.shape[0]
 
