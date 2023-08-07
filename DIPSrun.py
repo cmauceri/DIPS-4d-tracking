@@ -1,17 +1,22 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from numpy import load
+from numpy import save
+from numpy import asarray
 
 import h5py
+varnames=['sd0','sz0','st','ptfrac','dr','numPix','numSCT','d0','z0']
 
-filenames=[]
-varnames=['sd0','sz0','ptfrac','dr','numPix','numSCT','d0','z0']
-fullFile='data/output.hdf5_no_none'
-for var in varnames:
-    filenames.append('data/output.hdf5_no_'+var)
-def DIPSrun(f,nincvar):
-    print(f)
-    X_train       = f['X_train'][:]
+dname = f'/eos/home-c/cmauceri/DIPS_acts/DIPS-4d-tracking/data/output200PU.hdf5'
+f = h5py.File(dname,"r")
+
+def remIV(X_train,X_test,idx):
+    selected_train=np.delete(X_train,idx,axis=2)
+    selected_test=np.delete(X_test,idx,axis=2)
+    return selected_train,selected_test
+
+def DIPSrun(f,X_train,X_test,nincvar):
     y_train       = f['y_train'][:]
     ix_train      = f['ix_train'][:]
     weights_train = f['weights_train'][:] # Weights to avoid learning directly from the pT dist
@@ -108,9 +113,7 @@ def DIPSrun(f,nincvar):
                      callbacks=[earlyStop, dips_mChkPt])
     epochs = np.arange(1,len(dips_hist.history['loss'])+1)
 
-
-    # Making roc curve
-    X_test = f['X_test'][:]
+    
     y_test = f['y_test'][:]
     title = 'DIPS: $\Phi$ ' + '-'.join([str(i) for i in ppm_sizes_int])
     title += ', F ' + '-'.join([str(i) for i in dense_sizes_int])
@@ -119,8 +122,7 @@ def DIPSrun(f,nincvar):
     return effs
 def sigBkgEff(myModel, X_test, y_test, nincvar,fc=0.07, title=''):
     '''
-    Given a model, make the histograms of the model outputs to get the ROC curves.
-
+    Given a model get the ROC curves.
     Input:
         myModel: A keras model
         X_test: Model inputs of the test set
@@ -164,7 +166,7 @@ def sigBkgEff(myModel, X_test, y_test, nincvar,fc=0.07, title=''):
         
         # Plot the discriminant output
         # nEntries is just a sum of the weight of each bin in the histogram.
-        hi = plt.hist(disc[ix],nBins, myRange, alpha=0.5, density=True,
+        hi = plt.hist(disc[ix],nBins, myRange, histtype='step', density=True,
                       label=f'{flavor}-jets', log=True)[0]
         
         # Since high Db scores correspond to more b-like jets, compute the cummulative density function
@@ -172,42 +174,25 @@ def sigBkgEff(myModel, X_test, y_test, nincvar,fc=0.07, title=''):
         # using the "::-1" numpy indexing.
         eff = np.add.accumulate(hi[::-1]) / np.sum(hi)
         effs.append(eff)
-
-#    plt.title(title)
- #   plt.legend()
-  #  plt.xlabel('$D = \ln [ p_b / (f_c p_c + (1- f_c)p_l ) ]$',fontsize=14)
-   # plt.ylabel('Normalized entries')
-   # plt.savefig("roc_no_"+nincvar+".png")    
-    #plt.clf()
     return effs
-parameterlist=[r'$d_{0}/\sigma_{d0}$',r'$z_{0}sin{\theta}/\sigma_{z_{0}sin{\theta}}$',r'$p_{T}$ fraction',r'$\Delta$R',r'number of pixel hits',r'number of SCT hits',r'$d_{0}$ [mm]',r'$z_{0}$ [mm]']
-full_f= h5py.File(fullFile,"r")
-f_leff,f_ceff,f_beff=DIPSrun(full_f,'')
-for inputvar in range(len(varnames)):
-    dname=filenames[inputvar]
-    f = h5py.File(dname,"r")
-    nincvar=varnames[inputvar]
-    label = parameterlist[inputvar]
-    n_leff,n_ceff,n_beff= DIPSrun(f,nincvar)
-    plt.figure()
-    plt.plot()
-     # l-rej
-    plt.figure()
-    plt.plot(n_beff, 1 / n_leff, color='hotpink', label='l-rej (no '+str(label))
-
-    # c-rej
-    plt.plot(n_beff, 1 / n_ceff, color='hotpink', linestyle='--', label='c-rej (no '+str(label))
-    plt.xlabel('b efficiency')
-    plt.ylabel('Background rejection')
-   # l-rej
-    plt.plot(f_beff, 1 / f_leff, color='orange', label='l-rej')
-    # c-rej
-    plt.plot(f_beff, 1 / f_ceff, color='orange', linestyle='--', label='c-rej')
-    plt.xlabel('b efficiency')
-    plt.ylabel('Background rejection')
-    plt.title("ROC without "+str(label)+" vs. full Inputs")
-    plt.legend()
-    plt.yscale("log")
-    plt.xlim(0.6,1)
-    plt.savefig("roc_no_"+str(nincvar+".png"))
-    plt.clf()
+X_train=f['X_train'][:]
+X_test=f['X_test'][:]
+full_eff=DIPSrun(f,X_train,X_test,'')
+full_effArray=asarray(full_eff)
+save('roc_data/allvar.npy',full_effArray)
+for j in range(len(varnames)):
+    nwX_train=remIV(X_train,X_test,j)[0]
+    nwX_test=remIV(X_train,X_test,j)[1]
+    nincvar=varnames[j]
+    print(np.shape(nwX_train))
+    eff=DIPSrun(f,nwX_train,nwX_test,nincvar)
+    effArray=asarray(eff)
+    save('roc_data/no_'+str(nincvar)+'.npy',effArray)
+#selected_train=np.delete(X_train,6,axis=2)
+#selected_test=np.delete(X_test,6,axis=2)
+#selected_train=np.delete(selected_train,0,axis=2)
+#selected_test=np.delete(selected_test,0,axis=2)
+#eff=DIPSrun(f,selected_train,selected_test,'sd0_d0')
+#effArray=asarray(eff)
+#save('roc_data/no_sd0_d0.npy',effArray)
+    
